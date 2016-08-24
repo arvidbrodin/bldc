@@ -49,7 +49,7 @@ typedef struct {
 } mc_timer_struct;
 
 // Private variables
-static volatile int comm_step; // Range [1 6]
+static volatile int comm_step; // Range [0 5]
 static volatile int detect_step; // Range [0 5]
 static volatile int direction;
 static volatile float dutycycle_set;
@@ -148,6 +148,7 @@ static void do_dc_cal(void);
 
 // Defines
 #define IS_DETECTING()			(state == MC_STATE_DETECTING)
+#define COMM_STEPS			6
 
 // Threads
 static THD_WORKING_AREA(timer_thread_wa, 2048);
@@ -167,7 +168,7 @@ void mcpwm_init(volatile mc_configuration *configuration) {
 	conf = configuration;
 
 	// Initialize variables
-	comm_step = 1;
+	comm_step = 0;
 	detect_step = 0;
 	direction = 1;
 	rpm_now = 0.0;
@@ -652,10 +653,10 @@ void mcpwm_set_brake_current(float current) {
  * Get the electrical position (or commutation step) of the motor.
  *
  * @return
- * The current commutation step. Range [1 6]
+ * The current commutation step. Range [0 5]
  */
 int mcpwm_get_comm_step(void) {
-	return comm_step;
+	return comm_step ;
 }
 
 float mcpwm_get_duty_cycle_set(void) {
@@ -1009,7 +1010,7 @@ static void set_duty_cycle_ll(float dutyCycle) {
 		} else {
 			if (state != MC_STATE_RUNNING) {
 				state = MC_STATE_RUNNING;
-				comm_step = mcpwm_read_hall_phase();
+				comm_step = mcpwm_read_hall_phase() - 1;
 				set_next_comm_step(comm_step);
 				commutate(1);
 			}
@@ -1369,15 +1370,15 @@ void mcpwm_adc_inj_int_handler(void) {
 #if CURR1_DOUBLE_SAMPLE || CURR2_DOUBLE_SAMPLE
 	if (conf->pwm_mode != PWM_MODE_BIPOLAR && conf->motor_type == MOTOR_TYPE_BLDC) {
 		if (direction) {
-			if (CURR1_DOUBLE_SAMPLE && comm_step == 3) {
+			if (CURR1_DOUBLE_SAMPLE && comm_step == 2) {
 				curr0 = (curr0 + curr0_2) / 2.0;
-			} else if (CURR2_DOUBLE_SAMPLE && comm_step == 4) {
+			} else if (CURR2_DOUBLE_SAMPLE && comm_step == 3) {
 				curr1 = (curr1 + curr1_2) / 2.0;
 			}
 		} else {
-			if (CURR1_DOUBLE_SAMPLE && comm_step == 2) {
+			if (CURR1_DOUBLE_SAMPLE && comm_step == 1) {
 				curr0 = (curr0 + curr0_2) / 2.0;
-			} else if (CURR2_DOUBLE_SAMPLE && comm_step == 1) {
+			} else if (CURR2_DOUBLE_SAMPLE && comm_step == 0) {
 				curr1 = (curr1 + curr1_2) / 2.0;
 			}
 		}
@@ -1426,28 +1427,28 @@ void mcpwm_adc_inj_int_handler(void) {
 		} else {
 			if (direction) {
 				switch (comm_step) {
+				case 0: curr_tot_sample = -(float)ADC_curr_norm_value[1]; break;
 				case 1: curr_tot_sample = -(float)ADC_curr_norm_value[1]; break;
-				case 2: curr_tot_sample = -(float)ADC_curr_norm_value[1]; break;
-				case 3: curr_tot_sample = (float)ADC_curr_norm_value[0]; break;
-				case 4: curr_tot_sample = (float)ADC_curr_norm_value[1]; break;
+				case 2: curr_tot_sample = (float)ADC_curr_norm_value[0]; break;
+				case 3: curr_tot_sample = (float)ADC_curr_norm_value[1]; break;
+				case 4: curr_tot_sample = -(float)ADC_curr_norm_value[0]; break;
 				case 5: curr_tot_sample = -(float)ADC_curr_norm_value[0]; break;
-				case 6: curr_tot_sample = -(float)ADC_curr_norm_value[0]; break;
 				default: break;
 				}
 			} else {
 				switch (comm_step) {
-				case 1: curr_tot_sample = (float)ADC_curr_norm_value[1]; break;
-				case 2: curr_tot_sample = (float)ADC_curr_norm_value[0]; break;
+				case 0: curr_tot_sample = (float)ADC_curr_norm_value[1]; break;
+				case 1: curr_tot_sample = (float)ADC_curr_norm_value[0]; break;
+				case 2: curr_tot_sample = -(float)ADC_curr_norm_value[1]; break;
 				case 3: curr_tot_sample = -(float)ADC_curr_norm_value[1]; break;
-				case 4: curr_tot_sample = -(float)ADC_curr_norm_value[1]; break;
+				case 4: curr_tot_sample = -(float)ADC_curr_norm_value[0]; break;
 				case 5: curr_tot_sample = -(float)ADC_curr_norm_value[0]; break;
-				case 6: curr_tot_sample = -(float)ADC_curr_norm_value[0]; break;
 				default: break;
 				}
 			}
 
 			const float tot_sample_tmp = curr_tot_sample;
-			static int comm_step_prev = 1;
+			static int comm_step_prev = 0;
 			static float prev_tot_sample = 0.0;
 			if (comm_step != comm_step_prev) {
 				curr_tot_sample = prev_tot_sample;
@@ -1478,18 +1479,18 @@ void mcpwm_adc_inj_int_handler(void) {
 //			const int vzero = (ADC_V_L1 + ADC_V_L2 + ADC_V_L3) / 3;
 
 			switch (comm_step) {
+			case 0:
+			case 3:
+				mcpwm_detect_voltages[detect_step] = ADC_V_L1 - vzero;
+				break;
+
 			case 1:
 			case 4:
-				mcpwm_detect_voltages[detect_step] = ADC_V_L1 - vzero;
+				mcpwm_detect_voltages[detect_step] = ADC_V_L2 - vzero;
 				break;
 
 			case 2:
 			case 5:
-				mcpwm_detect_voltages[detect_step] = ADC_V_L2 - vzero;
-				break;
-
-			case 3:
-			case 6:
 				mcpwm_detect_voltages[detect_step] = ADC_V_L3 - vzero;
 				break;
 
@@ -1517,7 +1518,7 @@ void mcpwm_adc_inj_int_handler(void) {
 				detect_step = 0;
 			}
 
-			comm_step = detect_step + 1;
+			comm_step = detect_step;
 
 			set_next_comm_step(comm_step);
 			TIM_GenerateEvent(TIM1, TIM_EventSource_COM);
@@ -1632,27 +1633,27 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 				int ph_now_raw = 0;
 
 				switch (comm_step) {
-				case 1:
+				case 0:
 					v_diff = ph1;
 					ph_now_raw = ph1_raw;
 					break;
-				case 2:
+				case 1:
 					v_diff = -ph2;
 					ph_now_raw = ph2_raw;
 					break;
-				case 3:
+				case 2:
 					v_diff = ph3;
 					ph_now_raw = ph3_raw;
 					break;
-				case 4:
+				case 3:
 					v_diff = -ph1;
 					ph_now_raw = ph1_raw;
 					break;
-				case 5:
+				case 4:
 					v_diff = ph2;
 					ph_now_raw = ph2_raw;
 					break;
-				case 6:
+				case 5:
 					v_diff = -ph3;
 					ph_now_raw = ph3_raw;
 					break;
@@ -1664,7 +1665,7 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 				// because positive timing is much better than negative timing in case they are
 				// mis-aligned.
 				if (v_diff < 50) {
-					hall_detect_table[read_hall()][comm_step]++;
+					hall_detect_table[read_hall()][comm_step + 1]++;
 				}
 
 				// Don't commutate while the motor is standing still and the signal only consists
@@ -1726,7 +1727,7 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 			pwm_cycles_sum += (float)MCPWM_SWITCH_FREQUENCY_MAX / switching_frequency_now;
 			pwm_cycles++;
 		} else {
-			const int hall_phase = mcpwm_read_hall_phase();
+			const int hall_phase = mcpwm_read_hall_phase() - 1;
 			if (comm_step != hall_phase) {
 				comm_step = hall_phase;
 
@@ -2100,21 +2101,21 @@ static int read_hall(void) {
 /*
  * Commutation Steps FORWARDS
  * STEP		BR1		BR2		BR3
- * 1		0		+		-
- * 2		+		0		-
- * 3		+		-		0
- * 4		0		-		+
- * 5		-		0		+
- * 6		-		+		0
+ * 0		0		+		-
+ * 1		+		0		-
+ * 2		+		-		0
+ * 3		0		-		+
+ * 4		-		0		+
+ * 5		-		+		0
  *
  * Commutation Steps REVERSE (switch phase 2 and 3)
  * STEP		BR1		BR2		BR3
- * 1		0		-		+
- * 2		+		-		0
- * 3		+		0		-
- * 4		0		+		-
- * 5		-		+		0
- * 6		-		0		+
+ * 0		0		-		+
+ * 1		+		-		0
+ * 2		+		0		-
+ * 3		0		+		-
+ * 4		-		+		0
+ * 5		-		0		+
  */
 
 static void update_adc_sample_pos(mc_timer_struct *timer_tmp) {
@@ -2166,7 +2167,7 @@ static void update_adc_sample_pos(mc_timer_struct *timer_tmp) {
 
 				// Current sampling
 				switch (comm_step) {
-				case 1:
+				case 0:
 					if (direction) {
 						curr1_sample = samp_zero;
 						curr2_sample = samp_neg;
@@ -2177,7 +2178,7 @@ static void update_adc_sample_pos(mc_timer_struct *timer_tmp) {
 					}
 					break;
 
-				case 2:
+				case 1:
 					if (direction) {
 						curr1_sample = samp_pos;
 						curr2_sample = samp_neg;
@@ -2188,12 +2189,23 @@ static void update_adc_sample_pos(mc_timer_struct *timer_tmp) {
 					}
 					break;
 
-				case 3:
+				case 2:
 					if (direction) {
 						curr1_sample = samp_pos;
 						curr2_sample = samp_zero;
 					} else {
 						curr1_sample = samp_pos;
+						curr2_sample = samp_neg;
+						curr_samp_volt = 2;
+					}
+					break;
+
+				case 3:
+					if (direction) {
+						curr1_sample = samp_zero;
+						curr2_sample = samp_pos;
+					} else {
+						curr1_sample = samp_zero;
 						curr2_sample = samp_neg;
 						curr_samp_volt = 2;
 					}
@@ -2201,17 +2213,6 @@ static void update_adc_sample_pos(mc_timer_struct *timer_tmp) {
 
 				case 4:
 					if (direction) {
-						curr1_sample = samp_zero;
-						curr2_sample = samp_pos;
-					} else {
-						curr1_sample = samp_zero;
-						curr2_sample = samp_neg;
-						curr_samp_volt = 2;
-					}
-					break;
-
-				case 5:
-					if (direction) {
 						curr1_sample = samp_neg;
 						curr2_sample = samp_pos;
 						curr_samp_volt = 1;
@@ -2222,7 +2223,7 @@ static void update_adc_sample_pos(mc_timer_struct *timer_tmp) {
 					}
 					break;
 
-				case 6:
+				case 5:
 					if (direction) {
 						curr1_sample = samp_neg;
 						curr2_sample = samp_zero;
@@ -2250,7 +2251,7 @@ static void update_adc_sample_pos(mc_timer_struct *timer_tmp) {
 				// where possible
 				if (duty > (top / 2)) {
 #if CURR1_DOUBLE_SAMPLE
-					if (comm_step == 2 || comm_step == 3) {
+					if (comm_step == 1 || comm_step == 2) {
 						curr1_sample = duty + 90;
 						curr2_sample = top - 230;
 					}
@@ -2258,12 +2259,12 @@ static void update_adc_sample_pos(mc_timer_struct *timer_tmp) {
 
 #if CURR2_DOUBLE_SAMPLE
 					if (direction) {
-						if (comm_step == 4 || comm_step == 5) {
+						if (comm_step == 3 || comm_step == 4) {
 							curr1_sample = duty + 90;
 							curr2_sample = top - 230;
 						}
 					} else {
-						if (comm_step == 1 || comm_step == 6) {
+						if (comm_step == 0 || comm_step == 5) {
 							curr1_sample = duty + 90;
 							curr2_sample = top - 230;
 						}
@@ -2272,22 +2273,22 @@ static void update_adc_sample_pos(mc_timer_struct *timer_tmp) {
 
 					if (direction) {
 						switch (comm_step) {
-						case 1: curr_samp_volt = 3; break;
+						case 0: curr_samp_volt = 3; break;
+						case 1: curr_samp_volt = 2; break;
 						case 2: curr_samp_volt = 2; break;
-						case 3: curr_samp_volt = 2; break;
+						case 3: curr_samp_volt = 1; break;
 						case 4: curr_samp_volt = 1; break;
-						case 5: curr_samp_volt = 1; break;
-						case 6: curr_samp_volt = 3; break;
+						case 5: curr_samp_volt = 3; break;
 						default: break;
 						}
 					} else {
 						switch (comm_step) {
-						case 1: curr_samp_volt = 1; break;
+						case 0: curr_samp_volt = 1; break;
+						case 1: curr_samp_volt = 2; break;
 						case 2: curr_samp_volt = 2; break;
-						case 3: curr_samp_volt = 2; break;
+						case 3: curr_samp_volt = 3; break;
 						case 4: curr_samp_volt = 3; break;
-						case 5: curr_samp_volt = 3; break;
-						case 6: curr_samp_volt = 1; break;
+						case 5: curr_samp_volt = 1; break;
 						default: break;
 						}
 					}
@@ -2302,7 +2303,7 @@ static void update_adc_sample_pos(mc_timer_struct *timer_tmp) {
 }
 
 static void update_rpm_tacho(void) {
-	int step = comm_step - 1;
+	int step = comm_step;
 	static int last_step = 0;
 	int tacho_diff = (step - last_step) % 6;
 	last_step = step;
@@ -2342,17 +2343,17 @@ static void update_sensor_mode(void) {
 
 static void commutate(int steps) {
 	last_pwm_cycles_sum = pwm_cycles_sum;
-	last_pwm_cycles_sums[comm_step - 1] = pwm_cycles_sum;
+	last_pwm_cycles_sums[comm_step] = pwm_cycles_sum;
 	pwm_cycles_sum = 0;
 	pwm_cycles = 0;
 
 	if (conf->motor_type == MOTOR_TYPE_BLDC && sensorless_now) {
 		comm_step += steps;
-		while (comm_step > 6) {
-			comm_step -= 6;
+		while (comm_step >= COMM_STEPS) {
+			comm_step -= COMM_STEPS;
 		}
-		while (comm_step < 1) {
-			comm_step += 6;
+		while (comm_step < 0) {
+			comm_step += COMM_STEPS;
 		}
 
 		update_rpm_tacho();
@@ -2488,7 +2489,7 @@ static void set_next_comm_step(int next_step) {
 		}
 	}
 
-	if (next_step == 1) {
+	if (next_step == 0) {
 		if (direction) {
 			// 0
 			TIM_SelectOCxM(TIM1, TIM_Channel_1, TIM_OCMode_Inactive);
@@ -2514,6 +2515,38 @@ static void set_next_comm_step(int next_step) {
 			TIM_SelectOCxM(TIM1, TIM_Channel_3, positive_oc_mode);
 			TIM_CCxCmd(TIM1, TIM_Channel_3, positive_highside);
 			TIM_CCxNCmd(TIM1, TIM_Channel_3, positive_lowside);
+
+			// -
+			TIM_SelectOCxM(TIM1, TIM_Channel_2, negative_oc_mode);
+			TIM_CCxCmd(TIM1, TIM_Channel_2, negative_highside);
+			TIM_CCxNCmd(TIM1, TIM_Channel_2, negative_lowside);
+		}
+	} else if (next_step == 1) {
+		if (direction) {
+			// 0
+			TIM_SelectOCxM(TIM1, TIM_Channel_2, TIM_OCMode_Inactive);
+			TIM_CCxCmd(TIM1, TIM_Channel_2, TIM_CCx_Enable);
+			TIM_CCxNCmd(TIM1, TIM_Channel_2, TIM_CCxN_Disable);
+
+			// +
+			TIM_SelectOCxM(TIM1, TIM_Channel_1, positive_oc_mode);
+			TIM_CCxCmd(TIM1, TIM_Channel_1, positive_highside);
+			TIM_CCxNCmd(TIM1, TIM_Channel_1, positive_lowside);
+
+			// -
+			TIM_SelectOCxM(TIM1, TIM_Channel_3, negative_oc_mode);
+			TIM_CCxCmd(TIM1, TIM_Channel_3, negative_highside);
+			TIM_CCxNCmd(TIM1, TIM_Channel_3, negative_lowside);
+		} else {
+			// 0
+			TIM_SelectOCxM(TIM1, TIM_Channel_3, TIM_OCMode_Inactive);
+			TIM_CCxCmd(TIM1, TIM_Channel_3, TIM_CCx_Enable);
+			TIM_CCxNCmd(TIM1, TIM_Channel_3, TIM_CCxN_Disable);
+
+			// +
+			TIM_SelectOCxM(TIM1, TIM_Channel_1, positive_oc_mode);
+			TIM_CCxCmd(TIM1, TIM_Channel_1, positive_highside);
+			TIM_CCxNCmd(TIM1, TIM_Channel_1, positive_lowside);
 
 			// -
 			TIM_SelectOCxM(TIM1, TIM_Channel_2, negative_oc_mode);
@@ -2523,6 +2556,21 @@ static void set_next_comm_step(int next_step) {
 	} else if (next_step == 2) {
 		if (direction) {
 			// 0
+			TIM_SelectOCxM(TIM1, TIM_Channel_3, TIM_OCMode_Inactive);
+			TIM_CCxCmd(TIM1, TIM_Channel_3, TIM_CCx_Enable);
+			TIM_CCxNCmd(TIM1, TIM_Channel_3, TIM_CCxN_Disable);
+
+			// +
+			TIM_SelectOCxM(TIM1, TIM_Channel_1, positive_oc_mode);
+			TIM_CCxCmd(TIM1, TIM_Channel_1, positive_highside);
+			TIM_CCxNCmd(TIM1, TIM_Channel_1, positive_lowside);
+
+			// -
+			TIM_SelectOCxM(TIM1, TIM_Channel_2, negative_oc_mode);
+			TIM_CCxCmd(TIM1, TIM_Channel_2, negative_highside);
+			TIM_CCxNCmd(TIM1, TIM_Channel_2, negative_lowside);
+		} else {
+			// 0
 			TIM_SelectOCxM(TIM1, TIM_Channel_2, TIM_OCMode_Inactive);
 			TIM_CCxCmd(TIM1, TIM_Channel_2, TIM_CCx_Enable);
 			TIM_CCxNCmd(TIM1, TIM_Channel_2, TIM_CCxN_Disable);
@@ -2536,33 +2584,18 @@ static void set_next_comm_step(int next_step) {
 			TIM_SelectOCxM(TIM1, TIM_Channel_3, negative_oc_mode);
 			TIM_CCxCmd(TIM1, TIM_Channel_3, negative_highside);
 			TIM_CCxNCmd(TIM1, TIM_Channel_3, negative_lowside);
-		} else {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, TIM_CCxN_Disable);
-
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, positive_lowside);
-
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, negative_lowside);
 		}
 	} else if (next_step == 3) {
 		if (direction) {
 			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, TIM_CCxN_Disable);
+			TIM_SelectOCxM(TIM1, TIM_Channel_1, TIM_OCMode_Inactive);
+			TIM_CCxCmd(TIM1, TIM_Channel_1, TIM_CCx_Enable);
+			TIM_CCxNCmd(TIM1, TIM_Channel_1, TIM_CCxN_Disable);
 
 			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, positive_lowside);
+			TIM_SelectOCxM(TIM1, TIM_Channel_3, positive_oc_mode);
+			TIM_CCxCmd(TIM1, TIM_Channel_3, positive_highside);
+			TIM_CCxNCmd(TIM1, TIM_Channel_3, positive_lowside);
 
 			// -
 			TIM_SelectOCxM(TIM1, TIM_Channel_2, negative_oc_mode);
@@ -2570,14 +2603,14 @@ static void set_next_comm_step(int next_step) {
 			TIM_CCxNCmd(TIM1, TIM_Channel_2, negative_lowside);
 		} else {
 			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, TIM_CCxN_Disable);
+			TIM_SelectOCxM(TIM1, TIM_Channel_1, TIM_OCMode_Inactive);
+			TIM_CCxCmd(TIM1, TIM_Channel_1, TIM_CCx_Enable);
+			TIM_CCxNCmd(TIM1, TIM_Channel_1, TIM_CCxN_Disable);
 
 			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, positive_lowside);
+			TIM_SelectOCxM(TIM1, TIM_Channel_2, positive_oc_mode);
+			TIM_CCxCmd(TIM1, TIM_Channel_2, positive_highside);
+			TIM_CCxNCmd(TIM1, TIM_Channel_2, positive_lowside);
 
 			// -
 			TIM_SelectOCxM(TIM1, TIM_Channel_3, negative_oc_mode);
@@ -2587,38 +2620,6 @@ static void set_next_comm_step(int next_step) {
 	} else if (next_step == 4) {
 		if (direction) {
 			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, TIM_CCxN_Disable);
-
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, positive_lowside);
-
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, negative_lowside);
-		} else {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, TIM_CCxN_Disable);
-
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, positive_lowside);
-
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, negative_lowside);
-		}
-	} else if (next_step == 5) {
-		if (direction) {
-			// 0
 			TIM_SelectOCxM(TIM1, TIM_Channel_2, TIM_OCMode_Inactive);
 			TIM_CCxCmd(TIM1, TIM_Channel_2, TIM_CCx_Enable);
 			TIM_CCxNCmd(TIM1, TIM_Channel_2, TIM_CCxN_Disable);
@@ -2648,7 +2649,7 @@ static void set_next_comm_step(int next_step) {
 			TIM_CCxCmd(TIM1, TIM_Channel_1, negative_highside);
 			TIM_CCxNCmd(TIM1, TIM_Channel_1, negative_lowside);
 		}
-	} else if (next_step == 6) {
+	} else if (next_step == 5) {
 		if (direction) {
 			// 0
 			TIM_SelectOCxM(TIM1, TIM_Channel_3, TIM_OCMode_Inactive);

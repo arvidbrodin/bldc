@@ -994,8 +994,8 @@ void mc_interface_mc_timer_isr(void) {
 			a = 0;
 
 			if (mc_interface_get_state() == MC_STATE_DETECTING) {
-				m_curr0_samples[m_sample_now] = (int16_t)mcpwm_detect_currents[mcpwm_get_comm_step() - 1];
-				m_curr1_samples[m_sample_now] = (int16_t)mcpwm_detect_currents_diff[mcpwm_get_comm_step() - 1];
+				m_curr0_samples[m_sample_now] = (int16_t)mcpwm_detect_currents[mcpwm_get_comm_step()];
+				m_curr1_samples[m_sample_now] = (int16_t)mcpwm_detect_currents_diff[mcpwm_get_comm_step()];
 
 				m_ph1_samples[m_sample_now] = (int16_t)mcpwm_detect_voltages[0];
 				m_ph2_samples[m_sample_now] = (int16_t)mcpwm_detect_voltages[1];
