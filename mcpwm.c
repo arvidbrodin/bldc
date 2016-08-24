@@ -51,6 +51,7 @@ typedef struct {
 // Defines
 #define IS_DETECTING()			(state == MC_STATE_DETECTING)
 #define COMM_STEPS			6
+#define HALL_STATES			8
 
 // Private variables
 static volatile int comm_step; // Range [0 5]
@@ -94,7 +95,7 @@ static volatile float last_pwm_cycles_sum;
 static volatile float last_pwm_cycles_sums[6];
 static volatile bool dccal_done;
 static volatile bool sensorless_now;
-static volatile int hall_detect_table[8][COMM_STEPS];
+static volatile int hall_detect_table[HALL_STATES][COMM_STEPS];
 
 // KV FIR filter
 #define KV_FIR_TAPS_BITS		7
@@ -497,20 +498,20 @@ void mcpwm_set_configuration(volatile mc_configuration *configuration) {
 void mcpwm_init_hall_table(int8_t *table) {
 	const int fwd_to_rev[COMM_STEPS] = {0,5,4,3,2,1};
 
-	for (int i = 0;i < 8;i++) {
+	for (int hall_state = 0; hall_state < HALL_STATES; hall_state++) {
 		// table[] has values [1..6], convert to [0..5]
-		int ind_now = table[i];
+		int ind_now = table[hall_state];
 		if (ind_now > -1) {
 			ind_now--;
 		}
-		hall_to_phase_table[8 + i] = ind_now;
+		hall_to_phase_table[HALL_STATES + hall_state] = ind_now;
 
 		if (ind_now < 0) {
-			hall_to_phase_table[i] = ind_now;
+			hall_to_phase_table[hall_state] = ind_now;
 			continue;
 		}
 
-		hall_to_phase_table[i] = fwd_to_rev[ind_now];
+		hall_to_phase_table[hall_state] = fwd_to_rev[ind_now];
 	}
 }
 
@@ -2054,35 +2055,35 @@ int mcpwm_get_hall_detect_result(int8_t *table) {
 		return -3;
 	}
 
-	for (int i = 0;i < 8;i++) {
+	for (int hall_state = 0; hall_state < HALL_STATES; hall_state++) {
 		int samples = 0;
 		int res = -1;
 		for (int comm_step = 0; comm_step < COMM_STEPS; comm_step++) {
-			if (hall_detect_table[i][comm_step] > samples) {
-				samples = hall_detect_table[i][comm_step];
+			if (hall_detect_table[hall_state][comm_step] > samples) {
+				samples = hall_detect_table[hall_state][comm_step];
 				if (samples > 15) {
 					res = comm_step;
 				}
 			}
-			table[i] = res;
+			table[hall_state] = res;
 		}
 	}
 
 	int invalid_samp_num = 0;
 	int nums[COMM_STEPS] = {0, 0, 0, 0, 0, 0};
 	int tot_nums = 0;
-	for (int i = 0;i < 8;i++) {
-		if (table[i] == -1) {
+	for (int hall_state = 0; hall_state < HALL_STATES; hall_state++) {
+		if (table[hall_state] == -1) {
 			invalid_samp_num++;
 		} else {
-			if (!nums[table[i]]) {
-				nums[table[i]] = 1;
+			if (!nums[table[hall_state]]) {
+				nums[table[hall_state]] = 1;
 				tot_nums++;
 			}
 		}
 	}
 
-	for (int hall_state = 0; hall_state < 8; hall_state++) {
+	for (int hall_state = 0; hall_state < HALL_STATES; hall_state++) {
 		// Preserve range [1..6] for communication with bldc-tool etc.
 		if (table[hall_state] > -1)
 			table[hall_state]++;
@@ -2101,7 +2102,7 @@ int mcpwm_get_hall_detect_result(int8_t *table) {
  * The phase read.
  */
 int mcpwm_read_hall_phase(void) {
-	return hall_to_phase_table[read_hall() + (direction ? 8 : 0)];
+	return hall_to_phase_table[read_hall() + (direction ? HALL_STATES : 0)];
 }
 
 static int read_hall(void) {
