@@ -48,6 +48,10 @@ typedef struct {
 	volatile unsigned int curr2_sample;
 } mc_timer_struct;
 
+// Defines
+#define IS_DETECTING()			(state == MC_STATE_DETECTING)
+#define COMM_STEPS			6
+
 // Private variables
 static volatile int comm_step; // Range [0 5]
 static volatile int detect_step; // Range [0 5]
@@ -90,7 +94,7 @@ static volatile float last_pwm_cycles_sum;
 static volatile float last_pwm_cycles_sums[6];
 static volatile bool dccal_done;
 static volatile bool sensorless_now;
-static volatile int hall_detect_table[8][7];
+static volatile int hall_detect_table[8][COMM_STEPS];
 
 // KV FIR filter
 #define KV_FIR_TAPS_BITS		7
@@ -146,10 +150,6 @@ static void update_timer_attempt(void);
 static void set_switching_frequency(float frequency);
 static void do_dc_cal(void);
 
-// Defines
-#define IS_DETECTING()			(state == MC_STATE_DETECTING)
-#define COMM_STEPS			6
-
 // Threads
 static THD_WORKING_AREA(timer_thread_wa, 2048);
 static THD_FUNCTION(timer_thread, arg);
@@ -198,7 +198,7 @@ void mcpwm_init(volatile mc_configuration *configuration) {
 	last_pwm_cycles_sum = 0.0;
 	memset((float*)last_pwm_cycles_sums, 0, sizeof(last_pwm_cycles_sums));
 	dccal_done = false;
-	memset(hall_detect_table, 0, sizeof(hall_detect_table[0][0]) * 8 * 7);
+	memset(hall_detect_table, 0, sizeof(hall_detect_table));
 	update_sensor_mode();
 
 	mcpwm_init_hall_table((int8_t*)conf->hall_table);
@@ -495,13 +495,17 @@ void mcpwm_set_configuration(volatile mc_configuration *configuration) {
  * The commutations corresponding to the hall sensor states in the forward direction-
  */
 void mcpwm_init_hall_table(int8_t *table) {
-	const int fwd_to_rev[7] = {-1,1,6,5,4,3,2};
+	const int fwd_to_rev[COMM_STEPS] = {0,5,4,3,2,1};
 
 	for (int i = 0;i < 8;i++) {
-		hall_to_phase_table[8 + i] = table[i];
-		int ind_now = hall_to_phase_table[8 + i];
+		// table[] has values [1..6], convert to [0..5]
+		int ind_now = table[i];
+		if (ind_now > -1) {
+			ind_now--;
+		}
+		hall_to_phase_table[8 + i] = ind_now;
 
-		if (ind_now < 1) {
+		if (ind_now < 0) {
 			hall_to_phase_table[i] = ind_now;
 			continue;
 		}
@@ -1010,7 +1014,7 @@ static void set_duty_cycle_ll(float dutyCycle) {
 		} else {
 			if (state != MC_STATE_RUNNING) {
 				state = MC_STATE_RUNNING;
-				comm_step = mcpwm_read_hall_phase() - 1;
+				comm_step = mcpwm_read_hall_phase();
 				set_next_comm_step(comm_step);
 				commutate(1);
 			}
@@ -1665,7 +1669,7 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 				// because positive timing is much better than negative timing in case they are
 				// mis-aligned.
 				if (v_diff < 50) {
-					hall_detect_table[read_hall()][comm_step + 1]++;
+					hall_detect_table[read_hall()][comm_step]++;
 				}
 
 				// Don't commutate while the motor is standing still and the signal only consists
@@ -1727,7 +1731,7 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 			pwm_cycles_sum += (float)MCPWM_SWITCH_FREQUENCY_MAX / switching_frequency_now;
 			pwm_cycles++;
 		} else {
-			const int hall_phase = mcpwm_read_hall_phase() - 1;
+			const int hall_phase = mcpwm_read_hall_phase();
 			if (comm_step != hall_phase) {
 				comm_step = hall_phase;
 
@@ -2028,7 +2032,7 @@ bool mcpwm_is_dccal_done(void) {
  * Reset the hall sensor detection table
  */
 void mcpwm_reset_hall_detect_table(void) {
-	memset(hall_detect_table, 0, sizeof(hall_detect_table[0][0]) * 8 * 7);
+	memset(hall_detect_table, 0, sizeof(hall_detect_table));
 }
 
 /**
@@ -2053,11 +2057,11 @@ int mcpwm_get_hall_detect_result(int8_t *table) {
 	for (int i = 0;i < 8;i++) {
 		int samples = 0;
 		int res = -1;
-		for (int j = 1;j < 7;j++) {
-			if (hall_detect_table[i][j] > samples) {
-				samples = hall_detect_table[i][j];
+		for (int comm_step = 0; comm_step < COMM_STEPS; comm_step++) {
+			if (hall_detect_table[i][comm_step] > samples) {
+				samples = hall_detect_table[i][comm_step];
 				if (samples > 15) {
-					res = j;
+					res = comm_step;
 				}
 			}
 			table[i] = res;
@@ -2065,7 +2069,7 @@ int mcpwm_get_hall_detect_result(int8_t *table) {
 	}
 
 	int invalid_samp_num = 0;
-	int nums[7] = {0, 0, 0, 0, 0, 0, 0};
+	int nums[COMM_STEPS] = {0, 0, 0, 0, 0, 0};
 	int tot_nums = 0;
 	for (int i = 0;i < 8;i++) {
 		if (table[i] == -1) {
@@ -2076,6 +2080,12 @@ int mcpwm_get_hall_detect_result(int8_t *table) {
 				tot_nums++;
 			}
 		}
+	}
+
+	for (int hall_state = 0; hall_state < 8; hall_state++) {
+		// Preserve range [1..6] for communication with bldc-tool etc.
+		if (table[hall_state] > -1)
+			table[hall_state]++;
 	}
 
 	if (invalid_samp_num == 2 && tot_nums == 6) {
