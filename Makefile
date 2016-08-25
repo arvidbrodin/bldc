@@ -147,6 +147,7 @@ CSRC = $(STARTUPSRC) \
        ws2811.c \
        led_external.c \
        encoder.c \
+       hall.c \
        flash_helper.c \
        mc_interface.c \
        mcpwm_foc.c \

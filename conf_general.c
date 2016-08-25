@@ -14,6 +14,7 @@
 #include "utils.h"
 #include "stm32f4xx_conf.h"
 #include "timeout.h"
+#include "hall.h"
 
 #include <string.h>
 #include <math.h>
@@ -400,7 +401,7 @@ bool conf_general_detect_motor_param(float current, float min_rpm, float low_dut
 	}
 
 	// Reset hall sensor samples
-	mcpwm_reset_hall_detect_table();
+	hall_reset_detect_table();
 
 	// Run for a while to get hall sensor samples
 	mc_interface_lock_override_once();
@@ -433,7 +434,14 @@ bool conf_general_detect_motor_param(float current, float min_rpm, float low_dut
 	}
 
 	// Get hall detect result
-	*hall_res = mcpwm_get_hall_detect_result(hall_table);
+	/* CHECK:
+	 *  *hall_res should be -2 if WS2811_ENABLED
+	 *  *hall_res should be -3 if conf->m_sensor_port_mode != SENSOR_PORT_MODE_HALL
+	 *
+	 * But hall detection shouldn't even be initiated if hall sensors
+	 * aren't configured!
+	 */
+	*hall_res = hall_get_detect_result(hall_table);
 
 	*int_limit = mcpwm_read_reset_avg_cycle_integrator();
 

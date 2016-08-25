@@ -34,6 +34,7 @@
 #include "hal.h"
 #include "commands.h"
 #include "encoder.h"
+#include "hall.h"
 #include <math.h>
 
 // Global variables
@@ -1014,7 +1015,7 @@ void mc_interface_mc_timer_isr(void) {
 			m_curr_fir_samples[m_sample_now] = (int16_t)(mc_interface_get_tot_current() * 100.0);
 			m_f_sw_samples[m_sample_now] = (int16_t)(f_samp / 10.0);
 
-			m_status_samples[m_sample_now] = mcpwm_get_comm_step() | (mcpwm_read_hall_phase() << 3);
+			m_status_samples[m_sample_now] = mcpwm_get_comm_step() | (hall_read_phase() << 3);
 
 			m_sample_now++;
 

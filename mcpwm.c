@@ -37,6 +37,7 @@
 #include "hw.h"
 #include "terminal.h"
 #include "encoder.h"
+#include "hall.h"
 
 // Structs
 typedef struct {
@@ -50,8 +51,6 @@ typedef struct {
 
 // Defines
 #define IS_DETECTING()			(state == MC_STATE_DETECTING)
-#define COMM_STEPS			6
-#define HALL_STATES			8
 
 // Private variables
 static volatile int comm_step; // Range [0 5]
@@ -81,7 +80,6 @@ static volatile float switching_frequency_now;
 static volatile int ignore_iterations;
 static volatile mc_timer_struct timer_struct;
 static volatile int curr_samp_volt; // Use the voltage-synchronized samples for this current sample
-static int hall_to_phase_table[HALL_STATES];
 static volatile unsigned int cycles_running;
 static volatile unsigned int slow_ramping_cycles;
 static volatile int has_commutated;
@@ -95,7 +93,6 @@ static volatile float last_pwm_cycles_sum;
 static volatile float last_pwm_cycles_sums[6];
 static volatile bool dccal_done;
 static volatile bool sensorless_now;
-static volatile int hall_detect_table[HALL_STATES][COMM_STEPS];
 
 // KV FIR filter
 #define KV_FIR_TAPS_BITS		7
@@ -143,8 +140,6 @@ static void run_pid_control_pos(float dt);
 static void set_next_comm_step(int next_step);
 static void update_rpm_tacho(void);
 static void update_sensor_mode(void);
-static int read_hall(void);
-static int comm_step_rev_hall(int comm_step);
 static void update_adc_sample_pos(mc_timer_struct *timer_tmp);
 static void commutate(int steps);
 static void set_next_timer_settings(mc_timer_struct *settings);
@@ -200,10 +195,8 @@ void mcpwm_init(volatile mc_configuration *configuration) {
 	last_pwm_cycles_sum = 0.0;
 	memset((float*)last_pwm_cycles_sums, 0, sizeof(last_pwm_cycles_sums));
 	dccal_done = false;
-	memset(hall_detect_table, 0, sizeof(hall_detect_table));
+	hall_init((int8_t *)conf->hall_table);
 	update_sensor_mode();
-
-	mcpwm_init_hall_table((int8_t*)conf->hall_table);
 
 	// Create KV FIR filter
 	filter_create_fir_lowpass((float*)kv_fir_coeffs, KV_FIR_FCUT, KV_FIR_TAPS_BITS, 1);
@@ -485,26 +478,9 @@ void mcpwm_set_configuration(volatile mc_configuration *configuration) {
 
 	utils_sys_lock_cnt();
 	conf = configuration;
-	mcpwm_init_hall_table((int8_t*)conf->hall_table);
+	hall_set_table((int8_t *)conf->hall_table);
 	update_sensor_mode();
 	utils_sys_unlock_cnt();
-}
-
-/**
- * Initialize the hall sensor lookup table
- *
- * @param table
- * The commutations corresponding to the hall sensor states in the forward direction-
- */
-void mcpwm_init_hall_table(int8_t *table) {
-	for (int hall_state = 0; hall_state < HALL_STATES; hall_state++) {
-		// table[] has values [1..6], convert to [0..5]
-		int ind_now = table[hall_state];
-		if (ind_now > -1) {
-			ind_now--;
-		}
-		hall_to_phase_table[hall_state] = ind_now;
-	}
 }
 
 static void do_dc_cal(void) {
@@ -1007,9 +983,9 @@ static void set_duty_cycle_ll(float dutyCycle) {
 		} else {
 			if (state != MC_STATE_RUNNING) {
 				state = MC_STATE_RUNNING;
-				comm_step = mcpwm_read_hall_phase();
+				comm_step = hall_read_phase();
 				if (direction == 0)
-					comm_step = comm_step_rev_hall(comm_step);
+					comm_step = hall_comm_step_rev(comm_step);
 				set_next_comm_step(comm_step);
 				commutate(1);
 			}
@@ -1664,7 +1640,7 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 				// because positive timing is much better than negative timing in case they are
 				// mis-aligned.
 				if (v_diff < 50) {
-					hall_detect_table[read_hall()][comm_step]++;
+					hall_sample(comm_step);
 				}
 
 				// Don't commutate while the motor is standing still and the signal only consists
@@ -1726,9 +1702,9 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 			pwm_cycles_sum += (float)MCPWM_SWITCH_FREQUENCY_MAX / switching_frequency_now;
 			pwm_cycles++;
 		} else {
-			int hall_phase = mcpwm_read_hall_phase();
+			int hall_phase = hall_read_phase();
 			if (direction == 0)
-				hall_phase = comm_step_rev_hall(hall_phase);
+				hall_phase = hall_comm_step_rev(hall_phase);
 			if (comm_step != hall_phase) {
 				comm_step = hall_phase;
 
@@ -2023,92 +1999,6 @@ mc_rpm_dep_struct mcpwm_get_rpm_dep(void) {
 
 bool mcpwm_is_dccal_done(void) {
 	return dccal_done;
-}
-
-/**
- * Reset the hall sensor detection table
- */
-void mcpwm_reset_hall_detect_table(void) {
-	memset(hall_detect_table, 0, sizeof(hall_detect_table));
-}
-
-/**
- * Get the current detected hall sensor table
- *
- * @param table
- * Pointer to a table where the result should be stored
- *
- * @return
- * 0: OK
- * -1: Invalid hall sensor output
- * -2: WS2811 enabled
- * -3: Encoder enabled
- */
-int mcpwm_get_hall_detect_result(int8_t *table) {
-	if (WS2811_ENABLE) {
-		return -2;
-	} else if (conf->m_sensor_port_mode != SENSOR_PORT_MODE_HALL) {
-		return -3;
-	}
-
-	for (int hall_state = 0; hall_state < HALL_STATES; hall_state++) {
-		int samples = 0;
-		int res = -1;
-		for (int comm_step = 0; comm_step < COMM_STEPS; comm_step++) {
-			if (hall_detect_table[hall_state][comm_step] > samples) {
-				samples = hall_detect_table[hall_state][comm_step];
-				if (samples > 15) {
-					res = comm_step;
-				}
-			}
-			table[hall_state] = res;
-		}
-	}
-
-	int invalid_samp_num = 0;
-	int nums[COMM_STEPS] = {0, 0, 0, 0, 0, 0};
-	int tot_nums = 0;
-	for (int hall_state = 0; hall_state < HALL_STATES; hall_state++) {
-		if (table[hall_state] == -1) {
-			invalid_samp_num++;
-		} else {
-			if (!nums[table[hall_state]]) {
-				nums[table[hall_state]] = 1;
-				tot_nums++;
-			}
-		}
-	}
-
-	for (int hall_state = 0; hall_state < HALL_STATES; hall_state++) {
-		// Preserve range [1..6] for communication with bldc-tool etc.
-		if (table[hall_state] > -1)
-			table[hall_state]++;
-	}
-
-	if (invalid_samp_num == 2 && tot_nums == 6) {
-		return 0;
-	} else {
-		return -1;
-	}
-}
-
-static int comm_step_rev_hall(int comm_step) {
-	// This is equivalent to the earlier transformation using the
-	// lookup table fwd_to_rev[COMM_STEPS] = {0,5,4,3,2,1};
-	return (COMM_STEPS - comm_step) % COMM_STEPS;
-}
-
-/**
- * Read the current phase of the motor using hall effect sensors
- * @return
- * The phase read.
- */
-int mcpwm_read_hall_phase(void) {
-	return hall_to_phase_table[read_hall()];
-}
-
-static int read_hall(void) {
-	return READ_HALL1() | (READ_HALL2() << 1) | (READ_HALL3() << 2);
 }
 
 /*
