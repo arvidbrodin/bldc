@@ -114,9 +114,3 @@ void hall_sample(int comm_step) {
 int hall_read_phase(void) {
 	return hall_to_phase_table[read_hall()];
 }
-
-int hall_comm_step_rev(int comm_step) {
-	// This is equivalent to the earlier transformation using the
-	// lookup table fwd_to_rev[COMM_STEPS] = {0,5,4,3,2,1};
-	return (COMM_STEPS - comm_step) % COMM_STEPS;
-}

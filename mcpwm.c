@@ -142,6 +142,7 @@ static void update_rpm_tacho(void);
 static void update_sensor_mode(void);
 static void update_adc_sample_pos(mc_timer_struct *timer_tmp);
 static void commutate(int steps);
+static int reverse_comm_step(int comm_step);
 static void set_next_timer_settings(mc_timer_struct *settings);
 static void update_timer_attempt(void);
 static void set_switching_frequency(float frequency);
@@ -659,7 +660,7 @@ float mcpwm_get_switching_frequency_now(void) {
  * The RPM value.
  */
 float mcpwm_get_rpm(void) {
-	return direction ? rpm_now : -rpm_now;
+	return rpm_now * direction;
 }
 
 mc_state mcpwm_get_state(void) {
@@ -924,7 +925,7 @@ static void set_duty_cycle_ll(float dutyCycle) {
 		direction = 1;
 	} else if (dutyCycle <= -conf->l_min_duty) {
 		dutyCycle = -dutyCycle;
-		direction = 0;
+		direction = -1;
 	}
 
 	if (dutyCycle < conf->l_min_duty) {
@@ -963,7 +964,7 @@ static void set_duty_cycle_ll(float dutyCycle) {
 	if (conf->motor_type == MOTOR_TYPE_DC) {
 		state = MC_STATE_RUNNING;
 		set_next_comm_step(comm_step);
-		commutate(1);
+		commutate(direction);
 	} else {
 		if (sensorless_now) {
 			if (state != MC_STATE_RUNNING) {
@@ -971,12 +972,12 @@ static void set_duty_cycle_ll(float dutyCycle) {
 					state = MC_STATE_RUNNING;
 
 					if (fabsf(rpm_now) < conf->sl_min_erpm) {
-						commutate(1);
+						commutate(direction);
 					}
 				} else if (state == MC_STATE_FULL_BRAKE) {
 					if (fabsf(rpm_now) < conf->sl_min_erpm && mcpwm_get_tot_current_filtered() < conf->sl_max_fullbreak_current_dir_change) {
 						state = MC_STATE_RUNNING;
-						commutate(1);
+						commutate(direction);
 					}
 				}
 			}
@@ -984,10 +985,11 @@ static void set_duty_cycle_ll(float dutyCycle) {
 			if (state != MC_STATE_RUNNING) {
 				state = MC_STATE_RUNNING;
 				comm_step = hall_read_phase();
-				if (direction == 0)
-					comm_step = hall_comm_step_rev(comm_step);
+				if (direction == -1)
+					comm_step = reverse_comm_step(comm_step);
 				set_next_comm_step(comm_step);
-				commutate(1);
+				// CHECK: Shouldn't this be commutate(0), since we've just set the new comm_step?
+				commutate(direction);
 			}
 		}
 	}
@@ -1211,7 +1213,7 @@ static THD_FUNCTION(timer_thread, arg) {
 			// Direction tracking
 			if (conf->motor_type == MOTOR_TYPE_DC) {
 				if (amp > 0) {
-					direction = 0;
+					direction = -1;
 				} else {
 					direction = 1;
 					amp = -amp;
@@ -1242,7 +1244,7 @@ static THD_FUNCTION(timer_thread, arg) {
 					if ((max_s - min_s) / ((max_s + min_s) / 2.0) > 1.2) {
 						if (tachometer_for_direction > 12) {
 							if (direction == 1) {
-								direction = 0;
+								direction = -1;
 							} else {
 								direction = 1;
 							}
@@ -1256,7 +1258,7 @@ static THD_FUNCTION(timer_thread, arg) {
 					// not moving in the direction we think it is.
 					if (tachometer_for_direction < -3) {
 						if (direction == 1) {
-							direction = 0;
+							direction = -1;
 						} else {
 							direction = 1;
 						}
@@ -1267,11 +1269,7 @@ static THD_FUNCTION(timer_thread, arg) {
 				}
 			}
 
-			if (direction == 1) {
-				dutycycle_now = amp / (float)ADC_Value[ADC_IND_VIN_SENS];
-			} else {
-				dutycycle_now = -amp / (float)ADC_Value[ADC_IND_VIN_SENS];
-			}
+			dutycycle_now = amp * direction / (float)ADC_Value[ADC_IND_VIN_SENS];
 			utils_truncate_number((float*)&dutycycle_now, -conf->l_max_duty, conf->l_max_duty);
 		} else {
 			tachometer_for_direction = 0;
@@ -1344,18 +1342,10 @@ void mcpwm_adc_inj_int_handler(void) {
 
 #if CURR1_DOUBLE_SAMPLE || CURR2_DOUBLE_SAMPLE
 	if (conf->pwm_mode != PWM_MODE_BIPOLAR && conf->motor_type == MOTOR_TYPE_BLDC) {
-		if (direction) {
-			if (CURR1_DOUBLE_SAMPLE && comm_step == 2) {
-				curr0 = (curr0 + curr0_2) / 2.0;
-			} else if (CURR2_DOUBLE_SAMPLE && comm_step == 3) {
-				curr1 = (curr1 + curr1_2) / 2.0;
-			}
-		} else {
-			if (CURR1_DOUBLE_SAMPLE && comm_step == 1) {
-				curr0 = (curr0 + curr0_2) / 2.0;
-			} else if (CURR2_DOUBLE_SAMPLE && comm_step == 0) {
-				curr1 = (curr1 + curr1_2) / 2.0;
-			}
+		if (CURR1_DOUBLE_SAMPLE && comm_step == 2) {
+			curr0 = (curr0 + curr0_2) / 2.0;
+		} else if (CURR2_DOUBLE_SAMPLE && comm_step == 3) {
+			curr1 = (curr1 + curr1_2) / 2.0;
 		}
 	}
 #endif
@@ -1366,7 +1356,7 @@ void mcpwm_adc_inj_int_handler(void) {
 
 	float curr_tot_sample = 0;
 	if (conf->motor_type == MOTOR_TYPE_DC) {
-		if (direction) {
+		if (direction == 1) {
 			curr_tot_sample = -(float)(ADC_Value[ADC_IND_CURR2] - curr1_offset);
 		} else {
 			curr_tot_sample = -(float)(ADC_Value[ADC_IND_CURR1] - curr0_offset);
@@ -1374,52 +1364,20 @@ void mcpwm_adc_inj_int_handler(void) {
 	} else {
 		static int detect_now = 0;
 
-		/*
-		 * Commutation Steps FORWARDS
-		 * STEP		BR1		BR2		BR3
-		 * 1		0		+		-
-		 * 2		+		0		-
-		 * 3		+		-		0
-		 * 4		0		-		+
-		 * 5		-		0		+
-		 * 6		-		+		0
-		 *
-		 * Commutation Steps REVERSE (switch phase 2 and 3)
-		 * STEP		BR1		BR2		BR3
-		 * 1		0		-		+
-		 * 2		+		-		0
-		 * 3		+		0		-
-		 * 4		0		+		-
-		 * 5		-		+		0
-		 * 6		-		0		+
-		 */
-
 		if (state == MC_STATE_FULL_BRAKE) {
 			float c0 = (float)ADC_curr_norm_value[0];
 			float c1 = (float)ADC_curr_norm_value[1];
 			float c2 = (float)ADC_curr_norm_value[2];
 			curr_tot_sample = sqrtf((c0*c0 + c1*c1 + c2*c2) / 1.5);
 		} else {
-			if (direction) {
-				switch (comm_step) {
-				case 0: curr_tot_sample = -(float)ADC_curr_norm_value[1]; break;
-				case 1: curr_tot_sample = -(float)ADC_curr_norm_value[1]; break;
-				case 2: curr_tot_sample = (float)ADC_curr_norm_value[0]; break;
-				case 3: curr_tot_sample = (float)ADC_curr_norm_value[1]; break;
-				case 4: curr_tot_sample = -(float)ADC_curr_norm_value[0]; break;
-				case 5: curr_tot_sample = -(float)ADC_curr_norm_value[0]; break;
-				default: break;
-				}
-			} else {
-				switch (comm_step) {
-				case 0: curr_tot_sample = (float)ADC_curr_norm_value[1]; break;
-				case 1: curr_tot_sample = (float)ADC_curr_norm_value[0]; break;
-				case 2: curr_tot_sample = -(float)ADC_curr_norm_value[1]; break;
-				case 3: curr_tot_sample = -(float)ADC_curr_norm_value[1]; break;
-				case 4: curr_tot_sample = -(float)ADC_curr_norm_value[0]; break;
-				case 5: curr_tot_sample = -(float)ADC_curr_norm_value[0]; break;
-				default: break;
-				}
+			switch (comm_step) {
+			case 0: curr_tot_sample = -(float)ADC_curr_norm_value[1]; break;
+			case 1: curr_tot_sample = -(float)ADC_curr_norm_value[1]; break;
+			case 2: curr_tot_sample = (float)ADC_curr_norm_value[0]; break;
+			case 3: curr_tot_sample = (float)ADC_curr_norm_value[1]; break;
+			case 4: curr_tot_sample = -(float)ADC_curr_norm_value[0]; break;
+			case 5: curr_tot_sample = -(float)ADC_curr_norm_value[0]; break;
+			default: break;
 			}
 
 			const float tot_sample_tmp = curr_tot_sample;
@@ -1555,21 +1513,12 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 			mcpwm_vzero = (ADC_V_L1 + ADC_V_L2 + ADC_V_L3) / 3;
 		}
 
-		if (direction) {
-			ph1 = ADC_V_L1 - mcpwm_vzero;
-			ph2 = ADC_V_L2 - mcpwm_vzero;
-			ph3 = ADC_V_L3 - mcpwm_vzero;
-			ph1_raw = ADC_V_L1;
-			ph2_raw = ADC_V_L2;
-			ph3_raw = ADC_V_L3;
-		} else {
-			ph1 = ADC_V_L1 - mcpwm_vzero;
-			ph2 = ADC_V_L3 - mcpwm_vzero;
-			ph3 = ADC_V_L2 - mcpwm_vzero;
-			ph1_raw = ADC_V_L1;
-			ph2_raw = ADC_V_L3;
-			ph3_raw = ADC_V_L2;
-		}
+		ph1 = ADC_V_L1 - mcpwm_vzero;
+		ph2 = ADC_V_L2 - mcpwm_vzero;
+		ph3 = ADC_V_L3 - mcpwm_vzero;
+		ph1_raw = ADC_V_L1;
+		ph2_raw = ADC_V_L2;
+		ph3_raw = ADC_V_L3;
 
 		update_timer_attempt();
 
@@ -1594,9 +1543,9 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 						// This means that the motor is stuck. If this commutation does not
 						// produce any torque because of misalignment at start, two
 						// commutations ahead should produce full torque.
-						commutate(2);
+						commutate(direction + direction);
 					} else if (conf->comm_mode == COMM_MODE_DELAY) {
-						commutate(1);
+						commutate(direction);
 					}
 
 					cycle_integrator = 0.0;
@@ -1673,7 +1622,7 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 
 					if (cycle_integrator >= (rpm_dep.cycle_int_limit_max * (0.0005 * VDIV_CORR)) ||
 							cycle_integrator >= limit) {
-						commutate(1);
+						commutate(direction);
 						cycle_integrator = 0.0;
 					}
 				} else if (conf->comm_mode == COMM_MODE_DELAY) {
@@ -1684,7 +1633,7 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 						if (cycle_sum >= utils_map(fabsf(rpm_now), 0,
 								conf->sl_cycle_int_rpm_br, rpm_dep.comm_time_sum / 2.0,
 								(rpm_dep.comm_time_sum / 2.0) * conf->sl_phase_advance_at_br)) {
-							commutate(1);
+							commutate(direction);
 							cycle_integrator_sum += cycle_integrator * (1.0 / (0.0005 * VDIV_CORR));
 							cycle_integrator_iterations += 1.0;
 							cycle_integrator = 0.0;
@@ -1703,8 +1652,8 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 			pwm_cycles++;
 		} else {
 			int hall_phase = hall_read_phase();
-			if (direction == 0)
-				hall_phase = hall_comm_step_rev(hall_phase);
+			if (direction == -1)
+				hall_phase = reverse_comm_step(hall_phase);
 			if (comm_step != hall_phase) {
 				comm_step = hall_phase;
 
@@ -1758,7 +1707,7 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 
 		if (control_mode == CONTROL_MODE_CURRENT || control_mode == CONTROL_MODE_POS) {
 			// Compute error
-			const float error = current_set - (direction ? current_nofilter : -current_nofilter);
+			const float error = current_set - current_nofilter * direction;
 			float step = error * conf->cc_gain * voltage_scale;
 			const float start_boost = conf->cc_startup_boost_duty * voltage_scale;
 
@@ -1841,7 +1790,7 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 					ramp_step_no_lim * fabsf(current_nofilter - conf->lo_current_max) * conf->m_current_backoff_gain);
 			limit_delay = 1;
 		} else if (current_nofilter < conf->lo_current_min) {
-			utils_step_towards((float*) &dutycycle_now, direction ? conf->l_max_duty : -conf->l_max_duty,
+			utils_step_towards((float*) &dutycycle_now, conf->l_max_duty * direction,
 					ramp_step_no_lim * fabsf(current_nofilter - conf->lo_current_min) * conf->m_current_backoff_gain);
 			limit_delay = 1;
 		} else if (current_in_nofilter > conf->lo_in_current_max) {
@@ -1849,7 +1798,7 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 					ramp_step_no_lim * fabsf(current_in_nofilter - conf->lo_in_current_max) * conf->m_current_backoff_gain);
 			limit_delay = 1;
 		} else if (current_in_nofilter < conf->lo_in_current_min) {
-			utils_step_towards((float*) &dutycycle_now, direction ? conf->l_max_duty : -conf->l_max_duty,
+			utils_step_towards((float*) &dutycycle_now, conf->l_max_duty * direction,
 					ramp_step_no_lim * fabsf(current_in_nofilter - conf->lo_in_current_min) * conf->m_current_backoff_gain);
 			limit_delay = 1;
 		} else if (rpm > conf->l_max_erpm) {
@@ -2013,13 +1962,46 @@ bool mcpwm_is_dccal_done(void) {
  *
  * Commutation Steps REVERSE (switch phase 2 and 3)
  * STEP		BR1		BR2		BR3
- * 0		0		-		+
- * 1		+		-		0
- * 2		+		0		-
- * 3		0		+		-
- * 4		-		+		0
- * 5		-		0		+
+ * R0		0		-		+
+ * R1		+		-		0
+ * R2		+		0		-
+ * R3		0		+		-
+ * R4		-		+		0
+ * R5		-		0		+
+ *
+ * This REVERSE table shows one way of making the motor move in reverse
+ * (equivalent to physically switching two motor phases). Another way
+ * is to simply walk the steps in the FORWARDS table in reverse, which
+ * produces the same commutation sequence as in the REVERSE table.
+ *
+ * Given a rotor position and a row in the FORWARDS table that produces
+ * positive torque, to get the correct commutation config for negative
+ * torque at that rotor position, one needs to switch the two active
+ * phases:
+ *
+ * 							Rotor pos corresponding		Rotor pos corresponding
+ * STEP		BR1		BR2		BR3	to FORWARDS row			to REVERSE row
+ *
+ * 3		0		-		+	0				R0
+ * 4		-		0		+	1				R5
+ * 5		-		+		0	2				R4
+ * 0		0		+		-	3				R3
+ * 1		+		0		-	4				R2
+ * 2		+		-		0	5				R1
+ *
+ * I.e., using the commutation state numbering in the FORWARDS table,
+ * the correct commutation for negative torque at the same rotor
+ * position is (n + 3) % 6.
+ *
+ * We can use this both for switching between positive and negative
+ * torque, and for getting the correct reverse commutation config from
+ * the hall sensors.
+ *
  */
+
+static int reverse_comm_step(int comm_step) {
+	return (comm_step + 3) % COMM_STEPS;
+}
 
 static void update_adc_sample_pos(mc_timer_struct *timer_tmp) {
 	volatile uint32_t duty = timer_tmp->duty;
@@ -2071,71 +2053,37 @@ static void update_adc_sample_pos(mc_timer_struct *timer_tmp) {
 				// Current sampling
 				switch (comm_step) {
 				case 0:
-					if (direction) {
-						curr1_sample = samp_zero;
-						curr2_sample = samp_neg;
-						curr_samp_volt = 2;
-					} else {
-						curr1_sample = samp_zero;
-						curr2_sample = samp_pos;
-					}
+					curr1_sample = samp_zero;
+					curr2_sample = samp_neg;
+					curr_samp_volt = 2;
 					break;
 
 				case 1:
-					if (direction) {
-						curr1_sample = samp_pos;
-						curr2_sample = samp_neg;
-						curr_samp_volt = 2;
-					} else {
-						curr1_sample = samp_pos;
-						curr2_sample = samp_zero;
-					}
+					curr1_sample = samp_pos;
+					curr2_sample = samp_neg;
+					curr_samp_volt = 2;
 					break;
 
 				case 2:
-					if (direction) {
-						curr1_sample = samp_pos;
-						curr2_sample = samp_zero;
-					} else {
-						curr1_sample = samp_pos;
-						curr2_sample = samp_neg;
-						curr_samp_volt = 2;
-					}
+					curr1_sample = samp_pos;
+					curr2_sample = samp_zero;
 					break;
 
 				case 3:
-					if (direction) {
-						curr1_sample = samp_zero;
-						curr2_sample = samp_pos;
-					} else {
-						curr1_sample = samp_zero;
-						curr2_sample = samp_neg;
-						curr_samp_volt = 2;
-					}
+					curr1_sample = samp_zero;
+					curr2_sample = samp_pos;
 					break;
 
 				case 4:
-					if (direction) {
-						curr1_sample = samp_neg;
-						curr2_sample = samp_pos;
-						curr_samp_volt = 1;
-					} else {
-						curr1_sample = samp_neg;
-						curr2_sample = samp_zero;
-						curr_samp_volt = 1;
-					}
+					curr1_sample = samp_neg;
+					curr2_sample = samp_pos;
+					curr_samp_volt = 1;
 					break;
 
 				case 5:
-					if (direction) {
-						curr1_sample = samp_neg;
-						curr2_sample = samp_zero;
-						curr_samp_volt = 1;
-					} else {
-						curr1_sample = samp_neg;
-						curr2_sample = samp_pos;
-						curr_samp_volt = 1;
-					}
+					curr1_sample = samp_neg;
+					curr2_sample = samp_zero;
+					curr_samp_volt = 1;
 					break;
 				}
 			} else {
@@ -2161,39 +2109,20 @@ static void update_adc_sample_pos(mc_timer_struct *timer_tmp) {
 #endif
 
 #if CURR2_DOUBLE_SAMPLE
-					if (direction) {
-						if (comm_step == 3 || comm_step == 4) {
-							curr1_sample = duty + 90;
-							curr2_sample = top - 230;
-						}
-					} else {
-						if (comm_step == 0 || comm_step == 5) {
-							curr1_sample = duty + 90;
-							curr2_sample = top - 230;
-						}
+					if (comm_step == 3 || comm_step == 4) {
+						curr1_sample = duty + 90;
+						curr2_sample = top - 230;
 					}
 #endif
 
-					if (direction) {
-						switch (comm_step) {
-						case 0: curr_samp_volt = 3; break;
-						case 1: curr_samp_volt = 2; break;
-						case 2: curr_samp_volt = 2; break;
-						case 3: curr_samp_volt = 1; break;
-						case 4: curr_samp_volt = 1; break;
-						case 5: curr_samp_volt = 3; break;
-						default: break;
-						}
-					} else {
-						switch (comm_step) {
-						case 0: curr_samp_volt = 1; break;
-						case 1: curr_samp_volt = 2; break;
-						case 2: curr_samp_volt = 2; break;
-						case 3: curr_samp_volt = 3; break;
-						case 4: curr_samp_volt = 3; break;
-						case 5: curr_samp_volt = 1; break;
-						default: break;
-						}
+					switch (comm_step) {
+					case 0: curr_samp_volt = 3; break;
+					case 1: curr_samp_volt = 2; break;
+					case 2: curr_samp_volt = 2; break;
+					case 3: curr_samp_volt = 1; break;
+					case 4: curr_samp_volt = 1; break;
+					case 5: curr_samp_volt = 3; break;
+					default: break;
 					}
 				}
 			}
@@ -2227,11 +2156,7 @@ static void update_rpm_tacho(void) {
 	tachometer_for_direction += tacho_diff;
 	tachometer_abs += tacho_diff;
 
-	if (direction) {
-		tachometer += tacho_diff;
-	} else {
-		tachometer -= tacho_diff;
-	}
+	tachometer += tacho_diff * direction;
 }
 
 static void update_sensor_mode(void) {
@@ -2343,7 +2268,7 @@ static void set_next_comm_step(int next_step) {
 		TIM_CCxCmd(TIM1, TIM_Channel_2, TIM_CCx_Enable);
 		TIM_CCxNCmd(TIM1, TIM_Channel_2, TIM_CCxN_Disable);
 
-		if (direction) {
+		if (direction == 1) {
 			// +
 			TIM_SelectOCxM(TIM1, TIM_Channel_1, TIM_OCMode_PWM1);
 			TIM_CCxCmd(TIM1, TIM_Channel_1, TIM_CCx_Enable);
@@ -2393,197 +2318,95 @@ static void set_next_comm_step(int next_step) {
 	}
 
 	if (next_step == 0) {
-		if (direction) {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, TIM_CCxN_Disable);
+		// 0
+		TIM_SelectOCxM(TIM1, TIM_Channel_1, TIM_OCMode_Inactive);
+		TIM_CCxCmd(TIM1, TIM_Channel_1, TIM_CCx_Enable);
+		TIM_CCxNCmd(TIM1, TIM_Channel_1, TIM_CCxN_Disable);
 
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, positive_lowside);
+		// +
+		TIM_SelectOCxM(TIM1, TIM_Channel_2, positive_oc_mode);
+		TIM_CCxCmd(TIM1, TIM_Channel_2, positive_highside);
+		TIM_CCxNCmd(TIM1, TIM_Channel_2, positive_lowside);
 
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, negative_lowside);
-		} else {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, TIM_CCxN_Disable);
-
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, positive_lowside);
-
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, negative_lowside);
-		}
+		// -
+		TIM_SelectOCxM(TIM1, TIM_Channel_3, negative_oc_mode);
+		TIM_CCxCmd(TIM1, TIM_Channel_3, negative_highside);
+		TIM_CCxNCmd(TIM1, TIM_Channel_3, negative_lowside);
 	} else if (next_step == 1) {
-		if (direction) {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, TIM_CCxN_Disable);
+		// 0
+		TIM_SelectOCxM(TIM1, TIM_Channel_2, TIM_OCMode_Inactive);
+		TIM_CCxCmd(TIM1, TIM_Channel_2, TIM_CCx_Enable);
+		TIM_CCxNCmd(TIM1, TIM_Channel_2, TIM_CCxN_Disable);
 
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, positive_lowside);
+		// +
+		TIM_SelectOCxM(TIM1, TIM_Channel_1, positive_oc_mode);
+		TIM_CCxCmd(TIM1, TIM_Channel_1, positive_highside);
+		TIM_CCxNCmd(TIM1, TIM_Channel_1, positive_lowside);
 
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, negative_lowside);
-		} else {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, TIM_CCxN_Disable);
-
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, positive_lowside);
-
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, negative_lowside);
-		}
+		// -
+		TIM_SelectOCxM(TIM1, TIM_Channel_3, negative_oc_mode);
+		TIM_CCxCmd(TIM1, TIM_Channel_3, negative_highside);
+		TIM_CCxNCmd(TIM1, TIM_Channel_3, negative_lowside);
 	} else if (next_step == 2) {
-		if (direction) {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, TIM_CCxN_Disable);
+		// 0
+		TIM_SelectOCxM(TIM1, TIM_Channel_3, TIM_OCMode_Inactive);
+		TIM_CCxCmd(TIM1, TIM_Channel_3, TIM_CCx_Enable);
+		TIM_CCxNCmd(TIM1, TIM_Channel_3, TIM_CCxN_Disable);
 
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, positive_lowside);
+		// +
+		TIM_SelectOCxM(TIM1, TIM_Channel_1, positive_oc_mode);
+		TIM_CCxCmd(TIM1, TIM_Channel_1, positive_highside);
+		TIM_CCxNCmd(TIM1, TIM_Channel_1, positive_lowside);
 
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, negative_lowside);
-		} else {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, TIM_CCxN_Disable);
-
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, positive_lowside);
-
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, negative_lowside);
-		}
+		// -
+		TIM_SelectOCxM(TIM1, TIM_Channel_2, negative_oc_mode);
+		TIM_CCxCmd(TIM1, TIM_Channel_2, negative_highside);
+		TIM_CCxNCmd(TIM1, TIM_Channel_2, negative_lowside);
 	} else if (next_step == 3) {
-		if (direction) {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, TIM_CCxN_Disable);
+		// 0
+		TIM_SelectOCxM(TIM1, TIM_Channel_1, TIM_OCMode_Inactive);
+		TIM_CCxCmd(TIM1, TIM_Channel_1, TIM_CCx_Enable);
+		TIM_CCxNCmd(TIM1, TIM_Channel_1, TIM_CCxN_Disable);
 
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, positive_lowside);
+		// +
+		TIM_SelectOCxM(TIM1, TIM_Channel_3, positive_oc_mode);
+		TIM_CCxCmd(TIM1, TIM_Channel_3, positive_highside);
+		TIM_CCxNCmd(TIM1, TIM_Channel_3, positive_lowside);
 
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, negative_lowside);
-		} else {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, TIM_CCxN_Disable);
-
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, positive_lowside);
-
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, negative_lowside);
-		}
+		// -
+		TIM_SelectOCxM(TIM1, TIM_Channel_2, negative_oc_mode);
+		TIM_CCxCmd(TIM1, TIM_Channel_2, negative_highside);
+		TIM_CCxNCmd(TIM1, TIM_Channel_2, negative_lowside);
 	} else if (next_step == 4) {
-		if (direction) {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, TIM_CCxN_Disable);
+		// 0
+		TIM_SelectOCxM(TIM1, TIM_Channel_2, TIM_OCMode_Inactive);
+		TIM_CCxCmd(TIM1, TIM_Channel_2, TIM_CCx_Enable);
+		TIM_CCxNCmd(TIM1, TIM_Channel_2, TIM_CCxN_Disable);
 
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, positive_lowside);
+		// +
+		TIM_SelectOCxM(TIM1, TIM_Channel_3, positive_oc_mode);
+		TIM_CCxCmd(TIM1, TIM_Channel_3, positive_highside);
+		TIM_CCxNCmd(TIM1, TIM_Channel_3, positive_lowside);
 
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, negative_lowside);
-		} else {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, TIM_CCxN_Disable);
-
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, positive_lowside);
-
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, negative_lowside);
-		}
+		// -
+		TIM_SelectOCxM(TIM1, TIM_Channel_1, negative_oc_mode);
+		TIM_CCxCmd(TIM1, TIM_Channel_1, negative_highside);
+		TIM_CCxNCmd(TIM1, TIM_Channel_1, negative_lowside);
 	} else if (next_step == 5) {
-		if (direction) {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, TIM_CCxN_Disable);
+		// 0
+		TIM_SelectOCxM(TIM1, TIM_Channel_3, TIM_OCMode_Inactive);
+		TIM_CCxCmd(TIM1, TIM_Channel_3, TIM_CCx_Enable);
+		TIM_CCxNCmd(TIM1, TIM_Channel_3, TIM_CCxN_Disable);
 
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, positive_lowside);
+		// +
+		TIM_SelectOCxM(TIM1, TIM_Channel_2, positive_oc_mode);
+		TIM_CCxCmd(TIM1, TIM_Channel_2, positive_highside);
+		TIM_CCxNCmd(TIM1, TIM_Channel_2, positive_lowside);
 
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, negative_lowside);
-		} else {
-			// 0
-			TIM_SelectOCxM(TIM1, TIM_Channel_2, TIM_OCMode_Inactive);
-			TIM_CCxCmd(TIM1, TIM_Channel_2, TIM_CCx_Enable);
-			TIM_CCxNCmd(TIM1, TIM_Channel_2, TIM_CCxN_Disable);
-
-			// +
-			TIM_SelectOCxM(TIM1, TIM_Channel_3, positive_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_3, positive_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_3, positive_lowside);
-
-			// -
-			TIM_SelectOCxM(TIM1, TIM_Channel_1, negative_oc_mode);
-			TIM_CCxCmd(TIM1, TIM_Channel_1, negative_highside);
-			TIM_CCxNCmd(TIM1, TIM_Channel_1, negative_lowside);
-		}
+		// -
+		TIM_SelectOCxM(TIM1, TIM_Channel_1, negative_oc_mode);
+		TIM_CCxCmd(TIM1, TIM_Channel_1, negative_highside);
+		TIM_CCxNCmd(TIM1, TIM_Channel_1, negative_lowside);
 	} else {
 		// Invalid phase.. stop PWM!
 		TIM_SelectOCxM(TIM1, TIM_Channel_1, TIM_ForcedAction_InActive);
