@@ -81,7 +81,7 @@ static volatile float switching_frequency_now;
 static volatile int ignore_iterations;
 static volatile mc_timer_struct timer_struct;
 static volatile int curr_samp_volt; // Use the voltage-synchronized samples for this current sample
-static int hall_to_phase_table[16];
+static int hall_to_phase_table[HALL_STATES];
 static volatile unsigned int cycles_running;
 static volatile unsigned int slow_ramping_cycles;
 static volatile int has_commutated;
@@ -144,6 +144,7 @@ static void set_next_comm_step(int next_step);
 static void update_rpm_tacho(void);
 static void update_sensor_mode(void);
 static int read_hall(void);
+static int comm_step_rev_hall(int comm_step);
 static void update_adc_sample_pos(mc_timer_struct *timer_tmp);
 static void commutate(int steps);
 static void set_next_timer_settings(mc_timer_struct *settings);
@@ -496,22 +497,13 @@ void mcpwm_set_configuration(volatile mc_configuration *configuration) {
  * The commutations corresponding to the hall sensor states in the forward direction-
  */
 void mcpwm_init_hall_table(int8_t *table) {
-	const int fwd_to_rev[COMM_STEPS] = {0,5,4,3,2,1};
-
 	for (int hall_state = 0; hall_state < HALL_STATES; hall_state++) {
 		// table[] has values [1..6], convert to [0..5]
 		int ind_now = table[hall_state];
 		if (ind_now > -1) {
 			ind_now--;
 		}
-		hall_to_phase_table[HALL_STATES + hall_state] = ind_now;
-
-		if (ind_now < 0) {
-			hall_to_phase_table[hall_state] = ind_now;
-			continue;
-		}
-
-		hall_to_phase_table[hall_state] = fwd_to_rev[ind_now];
+		hall_to_phase_table[hall_state] = ind_now;
 	}
 }
 
@@ -1016,6 +1008,8 @@ static void set_duty_cycle_ll(float dutyCycle) {
 			if (state != MC_STATE_RUNNING) {
 				state = MC_STATE_RUNNING;
 				comm_step = mcpwm_read_hall_phase();
+				if (direction == 0)
+					comm_step = comm_step_rev_hall(comm_step);
 				set_next_comm_step(comm_step);
 				commutate(1);
 			}
@@ -1732,7 +1726,9 @@ void mcpwm_adc_int_handler(void *p, uint32_t flags) {
 			pwm_cycles_sum += (float)MCPWM_SWITCH_FREQUENCY_MAX / switching_frequency_now;
 			pwm_cycles++;
 		} else {
-			const int hall_phase = mcpwm_read_hall_phase();
+			int hall_phase = mcpwm_read_hall_phase();
+			if (direction == 0)
+				hall_phase = comm_step_rev_hall(hall_phase);
 			if (comm_step != hall_phase) {
 				comm_step = hall_phase;
 
@@ -2096,13 +2092,19 @@ int mcpwm_get_hall_detect_result(int8_t *table) {
 	}
 }
 
+static int comm_step_rev_hall(int comm_step) {
+	// This is equivalent to the earlier transformation using the
+	// lookup table fwd_to_rev[COMM_STEPS] = {0,5,4,3,2,1};
+	return (COMM_STEPS - comm_step) % COMM_STEPS;
+}
+
 /**
  * Read the current phase of the motor using hall effect sensors
  * @return
  * The phase read.
  */
 int mcpwm_read_hall_phase(void) {
-	return hall_to_phase_table[read_hall() + (direction ? HALL_STATES : 0)];
+	return hall_to_phase_table[read_hall()];
 }
 
 static int read_hall(void) {
